@@ -30,3 +30,6 @@ jobs:
         with:
           commit_message: 'update feed'
           file_pattern: feed.bin
+          commit_user_name: wiabs-bot
+          commit_user_email: bot@wiabs.app
+          commit_author: 'wiabs-bot <bot@wiabs.app>'

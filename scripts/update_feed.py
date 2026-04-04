@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Scrapes https://t.me/s/wiabsfeed for video posts, encodes them as protobuf,
-encrypts with AES-256-GCM, and writes feed.bin.
+Scrapes https://t.me/s/wiabsfeed for video posts, resolves original posts
+for real author names and titles, encodes as protobuf, encrypts with
+AES-256-GCM, and writes feed.bin.
 
 Protobuf wire format (compatible with packages/api/src/proto.ts):
 
@@ -23,9 +24,10 @@ WiabsGuestFeed (top-level):
 Encrypted format: [12 bytes nonce][ciphertext + 16 bytes GCM tag]
 """
 
+import base64
 import os
-import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +70,106 @@ def write_bytes_field(field_number: int, data: bytes) -> bytes:
     if not data:
         return b""
     return write_tag(field_number, 2) + write_varint(len(data)) + data
+
+
+# ---------------------------------------------------------------------------
+# Protobuf decoder (mirrors proto.ts decodeMessageCaption)
+# ---------------------------------------------------------------------------
+
+def base64url_decode(s: str) -> bytes:
+    """Decode base64url string (no padding) to bytes."""
+    s = s.replace("-", "+").replace("_", "/")
+    pad = 4 - len(s) % 4
+    if pad != 4:
+        s += "=" * pad
+    return base64.b64decode(s)
+
+
+def read_varint(data: bytes, offset: int) -> tuple[int, int]:
+    """Read a varint from data at offset, return (value, new_offset)."""
+    result = 0
+    shift = 0
+    pos = offset
+    while pos < len(data):
+        byte = data[pos]
+        result |= (byte & 0x7F) << shift
+        pos += 1
+        if (byte & 0x80) == 0:
+            break
+        shift += 7
+    return result & 0xFFFFFFFF, pos
+
+
+def decode_protobuf_fields(data: bytes) -> dict[int, list]:
+    """
+    Parse raw protobuf wire format into {field_number: [values...]}.
+    Supports repeated fields. Varint fields → int, len-delim → bytes.
+    """
+    fields: dict[int, list] = {}
+    pos = 0
+    while pos < len(data):
+        tag, pos = read_varint(data, pos)
+        field_number = tag >> 3
+        wire_type = tag & 0x7
+
+        if wire_type == 0:  # varint
+            value, pos = read_varint(data, pos)
+            fields.setdefault(field_number, []).append(value)
+        elif wire_type == 2:  # length-delimited
+            length, pos = read_varint(data, pos)
+            fields.setdefault(field_number, []).append(data[pos : pos + length])
+            pos += length
+        elif wire_type == 5:  # 32-bit
+            pos += 4
+        elif wire_type == 1:  # 64-bit
+            pos += 8
+        else:
+            break
+    return fields
+
+
+def get_string(fields: dict[int, list], num: int) -> str:
+    """Get first string value for field number."""
+    vals = fields.get(num)
+    if not vals or not isinstance(vals[0], (bytes, bytearray)):
+        return ""
+    return vals[0].decode("utf-8", errors="replace")
+
+
+def get_uint(fields: dict[int, list], num: int) -> int:
+    """Get first varint value for field number."""
+    vals = fields.get(num)
+    if not vals or not isinstance(vals[0], int):
+        return 0
+    return vals[0]
+
+
+MSG_TYPE_FEED_PREVIEW = 2
+WIABS_PREFIX = "WIABS:"
+
+
+def decode_feed_preview(caption: str) -> dict | None:
+    """
+    Decode a WIABS: caption as FeedPreview (type=2).
+    Returns {channelUsername, originalMsgId, title, duration} or None.
+    """
+    if not caption.startswith(WIABS_PREFIX):
+        return None
+    try:
+        data = base64url_decode(caption[len(WIABS_PREFIX) :])
+        fields = decode_protobuf_fields(data)
+        msg_type = get_uint(fields, 2)
+        if msg_type != MSG_TYPE_FEED_PREVIEW:
+            return None
+        return {
+            "channelUsername": get_string(fields, 3),
+            "originalMsgId": get_uint(fields, 4),
+            "title": get_string(fields, 7),
+            "duration": get_uint(fields, 6),
+        }
+    except Exception as e:
+        print(f"[feed] Failed to decode protobuf: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +218,66 @@ def encrypt_feed(data: bytes, key_hex: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Original post resolver — fetches real author name from personal channel
+# ---------------------------------------------------------------------------
+
+_channel_cache: dict[str, BeautifulSoup] = {}
+
+
+def get_channel_page(username: str) -> BeautifulSoup:
+    """Fetch and cache t.me/s/{username} page."""
+    if username in _channel_cache:
+        return _channel_cache[username]
+
+    url = f"https://t.me/s/{username}"
+    print(f"[feed]   Fetching original channel: {url}")
+    time.sleep(0.5)  # rate limit
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    _channel_cache[username] = soup
+    return soup
+
+
+def resolve_original_post(channel_username: str, msg_id: int) -> dict:
+    """
+    Fetch the original post from the author's personal channel.
+    Returns {"author": str, "title": str} with real values, or empty strings.
+    """
+    result = {"author": "", "title": ""}
+    try:
+        soup = get_channel_page(channel_username)
+        selector = f'.tgme_widget_message[data-post="{channel_username}/{msg_id}"]'
+        msg = soup.select_one(selector)
+        if not msg:
+            print(f"[feed]   Post {channel_username}/{msg_id} not found on page")
+            return result
+
+        # Author from signature profile
+        author_el = msg.select_one(".tgme_widget_message_from_author")
+        if author_el:
+            result["author"] = author_el.get_text(strip=True)
+
+        # Title from protobuf caption (type=1 EncryptedVideo, field 4 = title)
+        caption_el = msg.select_one(".js-message_text")
+        if caption_el:
+            caption_text = caption_el.get_text(strip=True)
+            if caption_text.startswith(WIABS_PREFIX):
+                try:
+                    data = base64url_decode(caption_text[len(WIABS_PREFIX) :])
+                    fields = decode_protobuf_fields(data)
+                    title = get_string(fields, 4)  # field 4 = title in EncryptedVideo
+                    if title:
+                        result["title"] = title
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[feed]   Failed to resolve {channel_username}/{msg_id}: {e}")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # HTML scraper for t.me/s/wiabsfeed
 # ---------------------------------------------------------------------------
 
@@ -149,7 +311,7 @@ def parse_views(text: str) -> int:
 
 
 def scrape_feed() -> list[dict]:
-    """Scrape t.me/s/wiabsfeed and extract video post data."""
+    """Scrape t.me/s/wiabsfeed, resolve originals, extract enriched data."""
     print(f"[feed] Fetching {FEED_URL}")
     resp = requests.get(FEED_URL, timeout=30)
     resp.raise_for_status()
@@ -170,29 +332,43 @@ def scrape_feed() -> list[dict]:
         if not cdn_url:
             continue
 
-        # Post ID
+        # Post ID in @wiabsfeed
         data_post = msg.get("data-post", "")
         post_parts = data_post.split("/")
         message_id = int(post_parts[1]) if len(post_parts) == 2 else 0
 
-        # Author
+        # Default author from @wiabsfeed (fallback)
         author_el = msg.select_one(".tgme_widget_message_from_author")
         author = author_el.get_text(strip=True) if author_el else ""
 
-        # Duration
+        # Duration from HTML
         duration_el = msg.select_one(".message_video_duration")
         duration = parse_duration(duration_el.get_text()) if duration_el else 0
 
-        # Caption / title
+        # Caption (protobuf)
         caption_el = msg.select_one(".js-message_text")
         caption = caption_el.get_text(strip=True) if caption_el else ""
 
-        # Extract title from WIABS protobuf caption if available
+        # Decode FeedPreview protobuf → get channelUsername, originalMsgId, title
         title = ""
-        if caption.startswith("WIABS:"):
-            # Title is embedded in protobuf; for guest feed we leave it
-            # as the raw caption — the client can parse it if needed
-            title = caption
+        preview = decode_feed_preview(caption)
+        if preview:
+            # Title from FeedPreview (field 7)
+            title = preview.get("title", "")
+            # Duration from protobuf if available
+            if preview.get("duration"):
+                duration = preview["duration"]
+
+            # Resolve original post for real author name
+            channel_username = preview.get("channelUsername", "")
+            original_msg_id = preview.get("originalMsgId", 0)
+            if channel_username and original_msg_id:
+                original = resolve_original_post(channel_username, original_msg_id)
+                if original["author"]:
+                    author = original["author"]
+                # If FeedPreview had no title, try EncryptedVideo title
+                if not title and original["title"]:
+                    title = original["title"]
         else:
             title = caption
 
@@ -235,7 +411,7 @@ def main():
 
     for item in items:
         print(f"  #{item['message_id']} by {item['author']} "
-              f"({item['duration']}s, {item['views']} views)")
+              f"- \"{item['title']}\" ({item['duration']}s, {item['views']} views)")
 
     updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     protobuf = encode_guest_feed(items, updated_at)
